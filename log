@@ -1,0 +1,4 @@
+[Transformer] loaded best validation checkpoint (R@10=0.0820, N@10=0.0483)    
+
+[Artifacts] Saved transformer stage artifact to artifacts.
+[Test] examples=22363 R@5=0.0280 N@5=0.0176 R@10=0.0422 N@10=0.0222                                                              

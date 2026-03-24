@@ -1,0 +1,7 @@
+/artifacts/
+/data/
+/og/
+/cache/
+/__pycache__/
+*.log
+*.tmp
