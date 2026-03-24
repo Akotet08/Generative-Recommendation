@@ -1,0 +1,12 @@
+wandb:
+    enabled: true
+    project: GenRec
+    entity: team-akotet
+    notes:
+    log_every_steps: 100
+
+tensorboard:
+    enabled: true
+    log_dir:
+    log_every_steps: 100
+    flush_secs: 30

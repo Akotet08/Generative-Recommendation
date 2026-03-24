@@ -5,7 +5,6 @@ seq2seq transformer on user histories expressed in Semantic-ID tokens.
 
 import argparse
 import copy
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -13,171 +12,33 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
-from dataset import AmazonDataset
+from dataset import (
+    SemanticSequenceDataset,
+    build_item_embedding_matrix,
+    collate_sequences,
+    filter_and_split_user_histories,
+    load_item_embeddings,
+    load_user_histories,
+)
 from rqvae import Quantizer
 from seq2seq_transformer import Transformer
-
-
-PAD_TOKEN = 0
-BOS_TOKEN = 1
-EOS_TOKEN = 2
-SPECIAL_TOKEN_COUNT = 3
-
-
-class SemanticSequenceDataset(Dataset):
-    """Seq2seq examples built from user histories and item Semantic IDs."""
-
-    def __init__(self, examples):
-        # Pre-tensorize once to avoid per-__getitem__ tensor creation overhead.
-        self.examples = [
-            (
-                torch.tensor(src, dtype=torch.long),
-                torch.tensor(tgt_in, dtype=torch.long),
-                torch.tensor(tgt_out, dtype=torch.long),
-            )
-            for src, tgt_in, tgt_out in examples
-        ]
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, index):
-        return self.examples[index]
-
-
-def load_user_histories(dataset_name=None, interactions_path=None):
-    """Load user -> ordered item history mapping."""
-    if interactions_path is not None:
-        with open(interactions_path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    if dataset_name is None:
-        raise ValueError("Provide either --dataset-name or --interactions-path.")
-    return AmazonDataset(dataset_name).data
-
-
-def load_item_embeddings(embeddings_path):
-    """Load precomputed item embeddings from a torch artifact."""
-    artifact = torch.load(embeddings_path, map_location="cpu")
-
-    if isinstance(artifact, dict) and "item_ids" in artifact and "embeddings" in artifact:
-        item_ids = artifact["item_ids"]
-        embeddings = artifact["embeddings"]
-        if not torch.is_tensor(embeddings):
-            embeddings = torch.tensor(embeddings, dtype=torch.float32)
-        return {
-            item_id: embeddings[index].float()
-            for index, item_id in enumerate(item_ids)
-        }
-
-    if isinstance(artifact, dict):
-        embedding_by_item = {}
-        for item_id, vector in artifact.items():
-            if torch.is_tensor(vector):
-                embedding_by_item[item_id] = vector.float()
-            else:
-                embedding_by_item[item_id] = torch.tensor(vector, dtype=torch.float32)
-        return embedding_by_item
-
-    raise ValueError(
-        "Unsupported embeddings artifact. Expected either "
-        "{'item_ids': ..., 'embeddings': ...} or {item_id: embedding}."
-    )
-
-
-def filter_and_split_user_histories(user_histories, min_reviews=5):
-    """Apply 5-core filtering and chronological leave-one-out evaluation."""
-    filtered_histories = {}
-    train_histories = {}
-    val_records = []
-    test_records = []
-
-    for user_id, history in user_histories.items():
-        if len(history) < min_reviews:
-            continue
-
-        filtered_histories[user_id] = history
-        train_histories[user_id] = history[:-2]
-        val_records.append((user_id, history[:-2], history[-2]))
-        test_records.append((user_id, history[:-1], history[-1]))
-
-    return filtered_histories, train_histories, val_records, test_records
-
-
-def build_item_embedding_matrix(user_histories, embedding_by_item):
-    """Collect unique items from the filtered dataset and stack their fixed embeddings."""
-    item_ids = sorted({item_id for history in user_histories.values() for item_id in history})
-    missing_items = [item_id for item_id in item_ids if item_id not in embedding_by_item]
-    if missing_items:
-        preview = ", ".join(missing_items[:5])
-        raise ValueError(
-            f"Missing embeddings for {len(missing_items)} items. First missing items: {preview}"
-        )
-
-    embeddings = torch.stack([embedding_by_item[item_id] for item_id in item_ids], dim=0)
-    return item_ids, embeddings
-
-
-def collate_sequences(batch):
-    """Pad variable-length source and target sequences."""
-    src_tensors, tgt_input_tensors, tgt_output_tensors = zip(*batch)
-    src = nn.utils.rnn.pad_sequence(src_tensors, batch_first=True, padding_value=PAD_TOKEN)
-    tgt_input = nn.utils.rnn.pad_sequence(
-        tgt_input_tensors,
-        batch_first=True,
-        padding_value=PAD_TOKEN,
-    )
-    tgt_output = nn.utils.rnn.pad_sequence(
-        tgt_output_tensors,
-        batch_first=True,
-        padding_value=PAD_TOKEN,
-    )
-    return src, tgt_input, tgt_output
-
-
-def stable_user_bucket(user_id, num_buckets):
-    """Deterministic user hashing to keep source vocabulary bounded."""
-    digest = hashlib.md5(user_id.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], byteorder="big") % num_buckets
-
-
-def build_token_sizes(semantic_ids, base_codebook_size, num_codebooks, strict_paper_vocab):
-    """Create one token block per SID position."""
-    if semantic_ids.size(1) < num_codebooks:
-        raise ValueError(
-            f"Expected at least {num_codebooks} SID positions, got {semantic_ids.size(1)}."
-        )
-
-    base_semantic_ids = semantic_ids[:, :num_codebooks]
-    if int(base_semantic_ids.max().item()) >= base_codebook_size:
-        raise ValueError(
-            "Base Semantic IDs exceed the RQ-VAE codebook size. "
-            f"Expected values in [0, {base_codebook_size - 1}]."
-        )
-
-    token_sizes = [base_codebook_size] * num_codebooks
-    if semantic_ids.size(1) > num_codebooks:
-        collision_vocab_size = int(semantic_ids[:, num_codebooks:].max().item()) + 1
-        if strict_paper_vocab and collision_vocab_size > base_codebook_size:
-            raise ValueError(
-                "Collision token cardinality exceeds 256. This run does not match the "
-                "paper's fixed 256 x 4 item-token vocabulary."
-            )
-        token_sizes.extend([max(collision_vocab_size, 1)] * (semantic_ids.size(1) - num_codebooks))
-
-    return token_sizes
-
-
-def semantic_id_to_tokens(semantic_id, token_sizes):
-    """Map each SID position to its own token block."""
-    offset = SPECIAL_TOKEN_COUNT
-    tokens = []
-    for position, token in enumerate(semantic_id):
-        tokens.append(offset + int(token))
-        offset += token_sizes[position]
-    return tokens
+from utils import (
+    BOS_TOKEN,
+    EOS_TOKEN,
+    PAD_TOKEN,
+    SPECIAL_TOKEN_COUNT,
+    ExperimentLogger,
+    build_position_token_blocks,
+    build_token_sizes,
+    get_default_transformer_steps,
+    load_runtime_config,
+    semantic_id_to_tokens,
+    stable_user_bucket,
+    tokens_to_semantic_id,
+)
 
 
 def build_transformer_examples(
@@ -354,6 +215,7 @@ def train_rqvae(
     epochs,
     log_every,
     kmeans_init_items,
+    logger=None,
 ):
     """Train the RQ-VAE on fixed item embeddings."""
     model = Quantizer(in_dim=item_embeddings.size(1)).to(device)
@@ -387,6 +249,18 @@ def train_rqvae(
         f"max_duplicates={init_summary['max_id_duplicates']} "
         f"usage={init_usage_text}"
     )
+    if logger is not None:
+        init_metrics = {
+            "latent_norm": init_summary["latent_norm_mean"],
+            "latent_std": init_summary["latent_std_mean"],
+            "p_unique_ids": init_summary["p_unique_ids"],
+            "max_duplicates": init_summary["max_id_duplicates"],
+        }
+        for level_index, level_summary in enumerate(init_summary["levels"]):
+            init_metrics[f"level_{level_index}_active_codes"] = level_summary["active_codes"]
+            init_metrics[f"level_{level_index}_usage_ratio"] = level_summary["usage_ratio"]
+            init_metrics[f"level_{level_index}_perplexity"] = level_summary["perplexity"]
+        logger.log_metrics(init_metrics, step=0, namespace="rqvae", force=True)
 
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -431,49 +305,116 @@ def train_rqvae(
                 f"rqvae_entropy={usage_summary['rqvae_entropy']:.3f} "
                 f"usage={usage_text}"
             )
+            if logger is not None:
+                rqvae_metrics = {
+                    "loss": mean_loss,
+                    "latent_norm": usage_summary["latent_norm_mean"],
+                    "latent_std": usage_summary["latent_std_mean"],
+                    "p_unique_ids": usage_summary["p_unique_ids"],
+                    "max_duplicates": usage_summary["max_id_duplicates"],
+                    "rqvae_entropy": usage_summary["rqvae_entropy"],
+                }
+                for level_index, level_summary in enumerate(usage_summary["levels"]):
+                    rqvae_metrics[f"level_{level_index}_active_codes"] = level_summary["active_codes"]
+                    rqvae_metrics[f"level_{level_index}_usage_ratio"] = level_summary["usage_ratio"]
+                    rqvae_metrics[f"level_{level_index}_perplexity"] = level_summary["perplexity"]
+                logger.log_metrics(rqvae_metrics, step=epoch, namespace="rqvae", force=True)
 
     return model
 
 
 @torch.no_grad()
-def score_all_candidates(
+def beam_search_next_items(
     model,
     memory,
     memory_key_padding_mask,
-    candidate_tgt_inputs,
-    candidate_tgt_outputs,
-    candidate_batch_size,
+    quantizer,
+    token_sizes,
+    position_token_blocks,
+    top_k,
+    beam_size,
+    max_beam_size,
+    beam_growth,
 ):
-    """Score all candidate items using pre-computed encoder memory.
+    """Autoregressively decode Semantic IDs with beam search."""
+    requested_top_k = max(int(top_k), 1)
+    beam_size = max(int(beam_size), requested_top_k)
+    max_beam_size = max(int(max_beam_size), beam_size)
+    beam_growth = max(int(beam_growth), 2)
+    eos_token_block = torch.tensor([EOS_TOKEN], dtype=torch.long, device=memory.device)
+    allowed_tokens_per_step = list(position_token_blocks) + [eos_token_block]
 
-    Accepts encoder output directly so the same source sequence is never
-    re-encoded across candidate batches.
-    """
-    all_scores = []
+    total_invalid_ids = 0
+    total_completed_beams = 0
+    attempts = 0
 
-    for start in range(0, candidate_tgt_inputs.size(0), candidate_batch_size):
-        end = start + candidate_batch_size
-        batch_tgt_inputs = candidate_tgt_inputs[start:end]
-        batch_tgt_outputs = candidate_tgt_outputs[start:end]
-        batch_size = batch_tgt_inputs.size(0)
+    while True:
+        attempts += 1
+        beams = [([BOS_TOKEN], 0.0)]
 
-        memory_batch = memory.expand(batch_size, -1, -1)
-        mem_pad_batch = memory_key_padding_mask.expand(batch_size, -1)
-        tgt_pad_mask = batch_tgt_inputs.eq(PAD_TOKEN)
+        for allowed_tokens in allowed_tokens_per_step:
+            beam_tokens = torch.tensor(
+                [tokens for tokens, _ in beams],
+                dtype=torch.long,
+                device=memory.device,
+            )
+            batch_size = beam_tokens.size(0)
+            memory_batch = memory.expand(batch_size, -1, -1)
+            mem_pad_batch = memory_key_padding_mask.expand(batch_size, -1)
 
-        logits = model.decode(
-            batch_tgt_inputs,
-            memory_batch,
-            tgt_key_padding_mask=tgt_pad_mask,
-            memory_key_padding_mask=mem_pad_batch,
-        )
-        log_probs = logits.log_softmax(dim=-1)
-        token_log_probs = log_probs.gather(2, batch_tgt_outputs.unsqueeze(-1)).squeeze(-1)
-        token_mask = batch_tgt_outputs.ne(PAD_TOKEN)
-        seq_scores = (token_log_probs * token_mask).sum(dim=1)
-        all_scores.append(seq_scores)
+            logits = model.decode(
+                beam_tokens,
+                memory_batch,
+                memory_key_padding_mask=mem_pad_batch,
+            )
+            step_log_probs = logits[:, -1, :].log_softmax(dim=-1)
+            allowed_log_probs = step_log_probs.index_select(dim=1, index=allowed_tokens)
 
-    return torch.cat(all_scores, dim=0)
+            per_beam_width = min(beam_size, allowed_tokens.numel())
+            top_log_probs, top_indices = torch.topk(
+                allowed_log_probs,
+                k=per_beam_width,
+                dim=1,
+            )
+
+            expanded_beams = []
+            for beam_index, (tokens, score) in enumerate(beams):
+                for candidate_rank in range(per_beam_width):
+                    next_token = int(
+                        allowed_tokens[top_indices[beam_index, candidate_rank]].item()
+                    )
+                    next_score = score + float(top_log_probs[beam_index, candidate_rank].item())
+                    expanded_beams.append((tokens + [next_token], next_score))
+
+            expanded_beams.sort(key=lambda item: item[1], reverse=True)
+            beams = expanded_beams[:beam_size]
+
+        total_completed_beams += len(beams)
+        ranked_items = []
+        seen_items = set()
+        invalid_ids = 0
+        for tokens, _ in beams:
+            semantic_id = tokens_to_semantic_id(tokens[1:-1], token_sizes)
+            item_id = quantizer.lookup_item(semantic_id)
+            if item_id is None:
+                invalid_ids += 1
+                continue
+            if item_id in seen_items:
+                continue
+            seen_items.add(item_id)
+            if len(ranked_items) < requested_top_k:
+                ranked_items.append(item_id)
+
+        total_invalid_ids += invalid_ids
+        if len(ranked_items) >= requested_top_k or beam_size >= max_beam_size:
+            return ranked_items, {
+                "beam_size_used": beam_size,
+                "attempts": attempts,
+                "invalid_ids": total_invalid_ids,
+                "completed_beams": total_completed_beams,
+            }
+
+        beam_size = min(max_beam_size, beam_size * beam_growth)
 
 
 def compute_ranking_metrics(rank_position):
@@ -497,24 +438,26 @@ def compute_ranking_metrics(rank_position):
 def evaluate_ranking(
     transformer,
     eval_queries,
-    candidate_index,
-    candidate_tgt_inputs,
-    candidate_tgt_outputs,
+    quantizer,
+    token_sizes,
     device,
-    candidate_batch_size,
+    top_k,
+    beam_size,
+    max_beam_size,
+    beam_growth,
+    query_batch_size,
     desc,
 ):
-    """Paper-style leave-one-out ranking evaluation with Recall/NDCG.
-
-    All query sources are batch-encoded in a single encoder forward pass.
-    Per-query scoring then runs the decoder only (no redundant re-encoding).
-    """
+    """Paper-style leave-one-out evaluation via autoregressive beam decoding."""
     empty_result = {
         "examples": 0,
         "recall@5": 0.0,
         "ndcg@5": 0.0,
         "recall@10": 0.0,
         "ndcg@10": 0.0,
+        "avg_beam_size": 0.0,
+        "avg_attempts": 0.0,
+        "invalid_id_rate": 0.0,
     }
     if not eval_queries:
         return empty_result
@@ -522,63 +465,72 @@ def evaluate_ranking(
     was_training = transformer.training
     transformer.eval()
 
-    # Filter to queries with valid targets and pre-tensorize sources.
-    src_list = []
-    target_indices = []
-    for src_tokens, target_item_id in eval_queries:
-        target_idx = candidate_index.get(target_item_id)
-        if target_idx is None:
-            continue
-        src_list.append(torch.tensor(src_tokens, dtype=torch.long, device=device))
-        target_indices.append(target_idx)
-
-    if not src_list:
+    filtered_queries = list(eval_queries)
+    if not filtered_queries:
         if was_training:
             transformer.train()
         return empty_result
 
-    # Batch-encode all query sources at once (single encoder forward pass).
-    src_padded = nn.utils.rnn.pad_sequence(
-        src_list, batch_first=True, padding_value=PAD_TOKEN,
-    )
-    src_pad_mask = src_padded.eq(PAD_TOKEN)
-    all_memories = transformer.encode(src_padded, src_key_padding_mask=src_pad_mask)
-
+    query_batch_size = max(int(query_batch_size), 1)
+    position_token_blocks = build_position_token_blocks(token_sizes, device)
     totals = {
         "recall@5": 0.0,
         "ndcg@5": 0.0,
         "recall@10": 0.0,
         "ndcg@10": 0.0,
     }
+    decode_totals = {
+        "beam_size_used": 0.0,
+        "attempts": 0.0,
+        "invalid_ids": 0.0,
+        "completed_beams": 0.0,
+    }
 
-    # Score each query against all candidates (decoder only, no re-encoding).
-    for i in tqdm(
-        range(len(src_list)),
+    for start in tqdm(
+        range(0, len(filtered_queries), query_batch_size),
         desc=desc,
         leave=False,
         dynamic_ncols=True,
     ):
-        memory_i = all_memories[i : i + 1]
-        mem_pad_i = src_pad_mask[i : i + 1]
+        batch_queries = filtered_queries[start : start + query_batch_size]
+        batch_src = [
+            torch.tensor(src_tokens, dtype=torch.long, device=device)
+            for src_tokens, _ in batch_queries
+        ]
+        batch_targets = [target_item_id for _, target_item_id in batch_queries]
 
-        candidate_scores = score_all_candidates(
-            model=transformer,
-            memory=memory_i,
-            memory_key_padding_mask=mem_pad_i,
-            candidate_tgt_inputs=candidate_tgt_inputs,
-            candidate_tgt_outputs=candidate_tgt_outputs,
-            candidate_batch_size=candidate_batch_size,
+        src_padded = nn.utils.rnn.pad_sequence(
+            batch_src,
+            batch_first=True,
+            padding_value=PAD_TOKEN,
         )
-        top_k = min(10, candidate_scores.size(0))
-        top_indices = torch.topk(candidate_scores, k=top_k).indices.tolist()
-        target_index = target_indices[i]
-        if target_index in top_indices:
-            rank_position = top_indices.index(target_index)
-            metrics = compute_ranking_metrics(rank_position)
-            for metric_name, metric_value in metrics.items():
-                totals[metric_name] += metric_value
+        src_pad_mask = src_padded.eq(PAD_TOKEN)
+        batch_memories = transformer.encode(src_padded, src_key_padding_mask=src_pad_mask)
 
-    evaluated_examples = len(src_list)
+        for batch_index, target_item_id in enumerate(batch_targets):
+            predicted_items, decode_stats = beam_search_next_items(
+                model=transformer,
+                memory=batch_memories[batch_index : batch_index + 1],
+                memory_key_padding_mask=src_pad_mask[batch_index : batch_index + 1],
+                quantizer=quantizer,
+                token_sizes=token_sizes,
+                position_token_blocks=position_token_blocks,
+                top_k=top_k,
+                beam_size=beam_size,
+                max_beam_size=max_beam_size,
+                beam_growth=beam_growth,
+            )
+
+            for stat_name, stat_value in decode_stats.items():
+                decode_totals[stat_name] += stat_value
+
+            if target_item_id in predicted_items:
+                rank_position = predicted_items.index(target_item_id)
+                metrics = compute_ranking_metrics(rank_position)
+                for metric_name, metric_value in metrics.items():
+                    totals[metric_name] += metric_value
+
+    evaluated_examples = len(filtered_queries)
 
     if was_training:
         transformer.train()
@@ -589,6 +541,9 @@ def evaluate_ranking(
         "ndcg@5": totals["ndcg@5"] / max(evaluated_examples, 1),
         "recall@10": totals["recall@10"] / max(evaluated_examples, 1),
         "ndcg@10": totals["ndcg@10"] / max(evaluated_examples, 1),
+        "avg_beam_size": decode_totals["beam_size_used"] / max(evaluated_examples, 1),
+        "avg_attempts": decode_totals["attempts"] / max(evaluated_examples, 1),
+        "invalid_id_rate": decode_totals["invalid_ids"] / max(decode_totals["completed_beams"], 1.0),
     }
 
 
@@ -605,10 +560,14 @@ def train_transformer(
     log_every,
     eval_every,
     val_queries,
-    candidate_index,
-    candidate_tgt_inputs,
-    candidate_tgt_outputs,
-    candidate_eval_batch_size,
+    quantizer,
+    token_sizes,
+    eval_top_k,
+    eval_beam_size,
+    eval_max_beam_size,
+    eval_beam_growth,
+    eval_query_batch_size,
+    logger=None,
 ):
     """Train the seq2seq transformer on Semantic-ID prediction."""
     model = Transformer(
@@ -681,27 +640,47 @@ def train_transformer(
         running_loss += loss.item() * non_pad_tokens
         total_tokens += non_pad_tokens
 
-        if step == 1 or step == train_steps or step % log_every == 0:
+        if step == train_steps or step % log_every == 0:
             mean_loss = running_loss / max(total_tokens, 1)
             postfix = {
                 "lr": f"{lr:.6f}",
                 "train_loss": f"{mean_loss:.6f}",
             }
+            transformer_metrics = {
+                "train_loss": mean_loss,
+                "lr": lr,
+            }
 
-            should_eval = val_queries and (step == 1 or step == train_steps or step % eval_every == 0)
+            should_eval = val_queries and (step == train_steps or step % eval_every == 0)
             if should_eval:
                 val_metrics = evaluate_ranking(
                     transformer=model,
                     eval_queries=val_queries,
-                    candidate_index=candidate_index,
-                    candidate_tgt_inputs=candidate_tgt_inputs,
-                    candidate_tgt_outputs=candidate_tgt_outputs,
+                    quantizer=quantizer,
+                    token_sizes=token_sizes,
                     device=device,
-                    candidate_batch_size=candidate_eval_batch_size,
+                    top_k=eval_top_k,
+                    beam_size=eval_beam_size,
+                    max_beam_size=eval_max_beam_size,
+                    beam_growth=eval_beam_growth,
+                    query_batch_size=eval_query_batch_size,
                     desc=f"Validation @ step {step}",
                 )
                 postfix["val_R@10"] = f"{val_metrics['recall@10']:.4f}"
                 postfix["val_N@10"] = f"{val_metrics['ndcg@10']:.4f}"
+                postfix["val_inv%"] = f"{100.0 * val_metrics['invalid_id_rate']:.2f}"
+                postfix["val_beam"] = f"{val_metrics['avg_beam_size']:.1f}"
+                transformer_metrics.update(
+                    {
+                        "val_recall@5": val_metrics["recall@5"],
+                        "val_ndcg@5": val_metrics["ndcg@5"],
+                        "val_recall@10": val_metrics["recall@10"],
+                        "val_ndcg@10": val_metrics["ndcg@10"],
+                        "val_invalid_id_rate": val_metrics["invalid_id_rate"],
+                        "val_avg_beam_size": val_metrics["avg_beam_size"],
+                        "val_avg_attempts": val_metrics["avg_attempts"],
+                    }
+                )
                 is_better = (
                     best_val_metrics is None
                     or val_metrics["recall@10"] > best_val_metrics["recall@10"]
@@ -713,6 +692,9 @@ def train_transformer(
                 if is_better:
                     best_val_metrics = val_metrics
                     best_state_dict = copy.deepcopy(model.state_dict())
+
+            if logger is not None:
+                logger.log_metrics(transformer_metrics, step=step, namespace="transformer", force=True)
 
             progress_bar.set_postfix(postfix)
             running_loss = 0.0
@@ -816,21 +798,9 @@ def save_transformer_artifact(output_dir, transformer):
     )
 
 
-def get_default_transformer_steps(dataset_name, interactions_path):
-    """Paper uses 200k steps for Beauty/Sports and 100k for Toys."""
-    dataset_key = ""
-    if dataset_name is not None:
-        dataset_key = dataset_name.lower()
-    elif interactions_path is not None:
-        dataset_key = interactions_path.stem.lower()
-
-    if "toys" in dataset_key:
-        return 100_000
-    return 200_000
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Train RQ-VAE and transformer for generative retrieval.")
+    parser.add_argument("--config", type=Path, default=Path("configs/base.yaml"))
     parser.add_argument("--dataset-name", type=str, default=None)
     parser.add_argument("--interactions-path", type=Path, default=None)
     parser.add_argument("--item-embeddings-path", type=Path, required=True)
@@ -849,24 +819,6 @@ def parse_args():
         action="store_true",
         help="Force RQ-VAE retraining even if a checkpoint exists.",
     )
-    parser.add_argument("--rqvae-batch-size", type=int, default=1024)
-    parser.add_argument("--rqvae-lr", type=float, default=5e-4)
-    parser.add_argument("--rqvae-weight-decay", type=float, default=0.01)
-    parser.add_argument("--rqvae-epochs", type=int, default=20000)
-    parser.add_argument("--rqvae-kmeans-init-items", type=int, default=20000)
-
-    parser.add_argument("--transformer-batch-size", type=int, default=256)
-    parser.add_argument("--transformer-lr", type=float, default=1e-4)
-    parser.add_argument("--transformer-train-steps", type=int, default=None)
-    parser.add_argument("--transformer-warmup-steps", type=int, default=10000)
-
-    parser.add_argument("--num-user-buckets", type=int, default=2000)
-    parser.add_argument("--max-history-items", type=int, default=20)
-    parser.add_argument("--min-user-reviews", type=int, default=5)
-    parser.add_argument("--log-every", type=int, default=1000)
-    parser.add_argument("--eval-every", type=int, default=10000)
-    parser.add_argument("--eval-candidate-batch-size", type=int, default=512)
-    parser.add_argument("--val-max-examples", type=int, default=256)
     parser.add_argument("--strict-paper-vocab", action="store_true")
     return parser.parse_args()
 
@@ -874,172 +826,228 @@ def parse_args():
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    transformer_train_steps = args.transformer_train_steps or get_default_transformer_steps(
-        args.dataset_name,
-        args.interactions_path,
+
+    full_config, training_config, logging_config = load_runtime_config(args.config)
+    data_config = training_config.get("data", {}) or {}
+    rqvae_config = training_config.get("rqvae", {}) or {}
+    transformer_config = training_config.get("transformer", {}) or {}
+    evaluation_config = training_config.get("evaluation", {}) or {}
+
+    eval_top_k = int(evaluation_config.get("top-k", 10))
+    if eval_top_k < 10:
+        raise ValueError("training.evaluation.top-k must be at least 10 to report Recall/NDCG@10.")
+
+    dataset_label = args.dataset_name
+    if dataset_label is None and args.interactions_path is not None:
+        dataset_label = args.interactions_path.stem
+    if dataset_label is None:
+        dataset_label = args.output_dir.name
+
+    experiment_logger = ExperimentLogger(
+        config=logging_config,
+        output_dir=args.output_dir,
+        run_name=dataset_label,
+        run_config={
+            "args": vars(args),
+            "config": full_config,
+        },
     )
 
-    user_histories = load_user_histories(
-        dataset_name=args.dataset_name,
-        interactions_path=args.interactions_path,
-    )
-    filtered_histories, train_histories, val_records, test_records = filter_and_split_user_histories(
-        user_histories,
-        min_reviews=args.min_user_reviews,
-    )
-    embedding_by_item = load_item_embeddings(args.item_embeddings_path)
-    item_ids, item_embeddings = build_item_embedding_matrix(filtered_histories, embedding_by_item)
-
-    print(
-        f"Loaded {len(filtered_histories)} filtered users and {len(item_ids)} unique items. "
-        f"Validation users: {len(val_records)}. Test users: {len(test_records)}."
-    )
-
-    # Decide whether to load an existing RQ-VAE checkpoint or train from scratch.
-    rqvae_checkpoint = args.output_dir / "rqvae.pt"
-    status_path = args.output_dir / "artifact_status.json"
-    rqvae_available = (
-        rqvae_checkpoint.exists()
-        and status_path.exists()
-        and json.loads(status_path.read_text(encoding="utf-8")).get("rqvae_complete", False)
-    )
-    should_train_rqvae = args.force_rqvae_training or (
-        not rqvae_available if args.skip_rqvae_training is None else not args.skip_rqvae_training
-    )
-
-    if should_train_rqvae:
-        rqvae = train_rqvae(
-            item_embeddings=item_embeddings,
-            device=device,
-            batch_size=args.rqvae_batch_size,
-            learning_rate=args.rqvae_lr,
-            weight_decay=args.rqvae_weight_decay,
-            epochs=args.rqvae_epochs,
-            log_every=args.log_every,
-            kmeans_init_items=args.rqvae_kmeans_init_items,
+    try:
+        transformer_train_steps = get_default_transformer_steps(
+            args.dataset_name,
+            args.interactions_path,
+            transformer_config.get("train-steps", {}) or {},
         )
 
-        semantic_ids = rqvae.build_semantic_ids_after_training(
-            item_embeddings.to(device),
-            item_ids=item_ids,
-        ).cpu()
-
-        token_sizes = build_token_sizes(
-            semantic_ids=semantic_ids,
-            base_codebook_size=rqvae.codebook_size,
-            num_codebooks=rqvae.num_codebooks,
-            strict_paper_vocab=args.strict_paper_vocab,
+        user_histories = load_user_histories(
+            dataset_name=args.dataset_name,
+            interactions_path=args.interactions_path,
         )
-        if len(token_sizes) > rqvae.num_codebooks and token_sizes[-1] > rqvae.codebook_size:
-            print(
-                "[Warning] Collision token vocabulary exceeds 256. "
-                f"Using adaptive c4 size={token_sizes[-1]} instead of strict paper 256."
+        filtered_histories, train_histories, val_records, test_records = filter_and_split_user_histories(
+            user_histories,
+            min_reviews=int(data_config.get("min-user-reviews", 5)),
+        )
+        embedding_by_item = load_item_embeddings(args.item_embeddings_path)
+        item_ids, item_embeddings = build_item_embedding_matrix(filtered_histories, embedding_by_item)
+
+        print(
+            f"Loaded {len(filtered_histories)} filtered users and {len(item_ids)} unique items. "
+            f"Validation users: {len(val_records)}. Test users: {len(test_records)}."
+        )
+        experiment_logger.log_metrics(
+            {
+                "filtered_users": len(filtered_histories),
+                "unique_items": len(item_ids),
+                "validation_users": len(val_records),
+                "test_users": len(test_records),
+            },
+            step=0,
+            namespace="data",
+            force=True,
+        )
+
+        rqvae_checkpoint = args.output_dir / "rqvae.pt"
+        status_path = args.output_dir / "artifact_status.json"
+        rqvae_available = (
+            rqvae_checkpoint.exists()
+            and status_path.exists()
+            and json.loads(status_path.read_text(encoding="utf-8")).get("rqvae_complete", False)
+        )
+        should_train_rqvae = args.force_rqvae_training or (
+            not rqvae_available if args.skip_rqvae_training is None else not args.skip_rqvae_training
+        )
+
+        if should_train_rqvae:
+            rqvae = train_rqvae(
+                item_embeddings=item_embeddings,
+                device=device,
+                batch_size=int(rqvae_config.get("batch-size", 1024)),
+                learning_rate=float(rqvae_config.get("lr", 5e-4)),
+                weight_decay=float(rqvae_config.get("weight-decay", 0.01)),
+                epochs=int(rqvae_config.get("epochs", 20_000)),
+                log_every=max(int(logging_config.get("wandb", {}).get("log_every_steps", 100)), 1),
+                kmeans_init_items=int(rqvae_config.get("kmeans-init-items", 20_000)),
+                logger=experiment_logger,
             )
-        save_rqvae_artifacts(
-            output_dir=args.output_dir,
-            quantizer=rqvae,
-            item_ids=item_ids,
-            semantic_ids=semantic_ids,
+
+            semantic_ids = rqvae.build_semantic_ids_after_training(
+                item_embeddings.to(device),
+                item_ids=item_ids,
+            ).cpu()
+
+            token_sizes = build_token_sizes(
+                semantic_ids=semantic_ids,
+                base_codebook_size=rqvae.codebook_size,
+                num_codebooks=rqvae.num_codebooks,
+                strict_paper_vocab=args.strict_paper_vocab,
+            )
+            if len(token_sizes) > rqvae.num_codebooks and token_sizes[-1] > rqvae.codebook_size:
+                print(
+                    "[Warning] Collision token vocabulary exceeds 256. "
+                    f"Using adaptive c4 size={token_sizes[-1]} instead of strict paper 256."
+                )
+            save_rqvae_artifacts(
+                output_dir=args.output_dir,
+                quantizer=rqvae,
+                item_ids=item_ids,
+                semantic_ids=semantic_ids,
+                token_sizes=token_sizes,
+                num_user_buckets=int(data_config.get("num-user-buckets", 2000)),
+                max_history_items=int(data_config.get("max-history-items", 20)),
+            )
+            print(f"[Artifacts] Saved RQ-VAE stage artifacts to {args.output_dir}.")
+        else:
+            rqvae, item_ids, semantic_ids = load_rqvae_checkpoint(
+                checkpoint_path=rqvae_checkpoint,
+                item_embeddings=item_embeddings,
+                device=device,
+            )
+            tokenizer_config_path = args.output_dir / "tokenizer_config.json"
+            with open(tokenizer_config_path, "r", encoding="utf-8") as handle:
+                tokenizer_config = json.load(handle)
+            token_sizes = tokenizer_config["token_sizes"]
+
+        examples, input_vocab_size, output_vocab_size, max_target_len = build_transformer_examples(
+            train_histories=train_histories,
+            item_to_semantic_id=rqvae.item_to_semantic_id,
+            num_user_buckets=int(data_config.get("num-user-buckets", 2000)),
+            max_history_items=int(data_config.get("max-history-items", 20)),
             token_sizes=token_sizes,
-            num_user_buckets=args.num_user_buckets,
-            max_history_items=args.max_history_items,
         )
-        print(f"[Artifacts] Saved RQ-VAE stage artifacts to {args.output_dir}.")
-    else:
-        rqvae, item_ids, semantic_ids = load_rqvae_checkpoint(
-            checkpoint_path=rqvae_checkpoint,
-            item_embeddings=item_embeddings,
+        if not examples:
+            raise ValueError("No transformer training examples could be built from the user histories.")
+
+        val_queries = build_eval_queries(
+            eval_records=val_records,
+            quantizer=rqvae,
+            token_sizes=token_sizes,
+            num_user_buckets=int(data_config.get("num-user-buckets", 2000)),
+            max_history_items=int(data_config.get("max-history-items", 20)),
+        )
+        full_val_count = len(val_queries)
+        val_queries = limit_eval_queries(val_queries, int(evaluation_config.get("val-max-examples", 256)))
+        test_queries = build_eval_queries(
+            eval_records=test_records,
+            quantizer=rqvae,
+            token_sizes=token_sizes,
+            num_user_buckets=int(data_config.get("num-user-buckets", 2000)),
+            max_history_items=int(data_config.get("max-history-items", 20)),
+        )
+        max_src_len = max(len(src_tokens) for src_tokens, _, _ in examples)
+
+        print(
+            f"Validation queries: {len(val_queries)}/{full_val_count} used during training. "
+            f"Test queries: {len(test_queries)}."
+        )
+        experiment_logger.log_metrics(
+            {
+                "train_examples": len(examples),
+                "validation_queries": len(val_queries),
+                "validation_queries_full": full_val_count,
+                "test_queries": len(test_queries),
+                "max_src_len": max_src_len,
+                "max_target_len": max_target_len,
+                "transformer_train_steps": transformer_train_steps,
+            },
+            step=0,
+            namespace="data",
+            force=True,
+        )
+
+        transformer = train_transformer(
+            examples=examples,
+            input_vocab_size=input_vocab_size,
+            output_vocab_size=output_vocab_size,
+            max_seq_len=max(max_src_len, max_target_len),
             device=device,
+            batch_size=int(transformer_config.get("batch-size", 256)),
+            learning_rate=float(transformer_config.get("lr", 1e-4)),
+            train_steps=transformer_train_steps,
+            warmup_steps=int(transformer_config.get("warmup-steps", 10_000)),
+            log_every=max(int(logging_config.get("wandb", {}).get("log_every_steps", 100)), 1),
+            eval_every=int(evaluation_config.get("every", 10_000)),
+            val_queries=val_queries,
+            quantizer=rqvae,
+            token_sizes=token_sizes,
+            eval_top_k=eval_top_k,
+            eval_beam_size=int(evaluation_config.get("beam-size", 40)),
+            eval_max_beam_size=int(evaluation_config.get("max-beam-size", 320)),
+            eval_beam_growth=int(evaluation_config.get("beam-growth", 2)),
+            eval_query_batch_size=int(evaluation_config.get("query-batch-size", 256)),
+            logger=experiment_logger,
         )
-        tokenizer_config_path = args.output_dir / "tokenizer_config.json"
-        with open(tokenizer_config_path, "r", encoding="utf-8") as handle:
-            tokenizer_config = json.load(handle)
-        token_sizes = tokenizer_config["token_sizes"]
+        save_transformer_artifact(args.output_dir, transformer)
+        print(f"[Artifacts] Saved transformer stage artifact to {args.output_dir}.")
 
-    examples, input_vocab_size, output_vocab_size, max_target_len = build_transformer_examples(
-        train_histories=train_histories,
-        item_to_semantic_id=rqvae.item_to_semantic_id,
-        num_user_buckets=args.num_user_buckets,
-        max_history_items=args.max_history_items,
-        token_sizes=token_sizes,
-    )
-    if not examples:
-        raise ValueError("No transformer training examples could be built from the user histories.")
+        test_metrics = evaluate_ranking(
+            transformer=transformer,
+            eval_queries=test_queries,
+            quantizer=rqvae,
+            token_sizes=token_sizes,
+            device=device,
+            top_k=eval_top_k,
+            beam_size=int(evaluation_config.get("beam-size", 40)),
+            max_beam_size=int(evaluation_config.get("max-beam-size", 320)),
+            beam_growth=int(evaluation_config.get("beam-growth", 2)),
+            query_batch_size=int(evaluation_config.get("query-batch-size", 256)),
+            desc="Test",
+        )
+        experiment_logger.log_metrics(test_metrics, step=transformer_train_steps, namespace="test", force=True)
+        print(
+            "[Test] "
+            f"examples={test_metrics['examples']} "
+            f"R@5={test_metrics['recall@5']:.4f} "
+            f"N@5={test_metrics['ndcg@5']:.4f} "
+            f"R@10={test_metrics['recall@10']:.4f} "
+            f"N@10={test_metrics['ndcg@10']:.4f} "
+            f"invalid_id_rate={100.0 * test_metrics['invalid_id_rate']:.2f}% "
+            f"avg_beam={test_metrics['avg_beam_size']:.1f}"
+        )
 
-    candidate_item_ids, candidate_tgt_inputs, candidate_tgt_outputs = build_candidate_token_bank(
-        item_ids=item_ids,
-        quantizer=rqvae,
-        token_sizes=token_sizes,
-    )
-    candidate_tgt_inputs = candidate_tgt_inputs.to(device)
-    candidate_tgt_outputs = candidate_tgt_outputs.to(device)
-    candidate_index = {
-        item_id: index for index, item_id in enumerate(candidate_item_ids)
-    }
-    val_queries = build_eval_queries(
-        eval_records=val_records,
-        quantizer=rqvae,
-        token_sizes=token_sizes,
-        num_user_buckets=args.num_user_buckets,
-        max_history_items=args.max_history_items,
-    )
-    full_val_count = len(val_queries)
-    val_queries = limit_eval_queries(val_queries, args.val_max_examples)
-    test_queries = build_eval_queries(
-        eval_records=test_records,
-        quantizer=rqvae,
-        token_sizes=token_sizes,
-        num_user_buckets=args.num_user_buckets,
-        max_history_items=args.max_history_items,
-    )
-    max_src_len = max(len(src_tokens) for src_tokens, _, _ in examples)
-
-    print(
-        f"Validation queries: {len(val_queries)}/{full_val_count} used during training. "
-        f"Test queries: {len(test_queries)}."
-    )
-
-    transformer = train_transformer(
-        examples=examples,
-        input_vocab_size=input_vocab_size,
-        output_vocab_size=output_vocab_size,
-        max_seq_len=max(max_src_len, max_target_len),
-        device=device,
-        batch_size=args.transformer_batch_size,
-        learning_rate=args.transformer_lr,
-        train_steps=transformer_train_steps,
-        warmup_steps=args.transformer_warmup_steps,
-        log_every=args.log_every,
-        eval_every=args.eval_every,
-        val_queries=val_queries,
-        candidate_index=candidate_index,
-        candidate_tgt_inputs=candidate_tgt_inputs,
-        candidate_tgt_outputs=candidate_tgt_outputs,
-        candidate_eval_batch_size=args.eval_candidate_batch_size,
-    )
-    save_transformer_artifact(args.output_dir, transformer)
-    print(f"[Artifacts] Saved transformer stage artifact to {args.output_dir}.")
-
-    test_metrics = evaluate_ranking(
-        transformer=transformer,
-        eval_queries=test_queries,
-        candidate_index=candidate_index,
-        candidate_tgt_inputs=candidate_tgt_inputs,
-        candidate_tgt_outputs=candidate_tgt_outputs,
-        device=device,
-        candidate_batch_size=args.eval_candidate_batch_size,
-        desc="Test",
-    )
-    print(
-        "[Test] "
-        f"examples={test_metrics['examples']} "
-        f"R@5={test_metrics['recall@5']:.4f} "
-        f"N@5={test_metrics['ndcg@5']:.4f} "
-        f"R@10={test_metrics['recall@10']:.4f} "
-        f"N@10={test_metrics['ndcg@10']:.4f}"
-    )
-
-    print(f"Artifacts available in {args.output_dir}.")
+        print(f"Artifacts available in {args.output_dir}.")
+    finally:
+        experiment_logger.close()
 
 
 if __name__ == "__main__":

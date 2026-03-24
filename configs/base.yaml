@@ -1,0 +1,44 @@
+inherit: 
+    - wandb.yaml
+
+training:
+    # Core data/preprocessing defaults used by main.py.
+    data:
+        min-user-reviews: 5
+        num-user-buckets: 2000
+        max-history-items: 20
+
+    # RQ-VAE stage defaults.
+    rqvae:
+        batch-size: 1024
+        lr: 0.0005
+        weight-decay: 0.01
+        epochs: 20000
+        kmeans-init-items: 20000
+
+    # Transformer stage defaults.
+    transformer:
+        batch-size: 256
+        lr: 0.0001
+        warmup-steps: 10000
+        train-steps:
+            default-beauty-and-sports: 200000
+            default-toys: 100000
+            override:
+
+    # Validation/evaluation defaults.
+    evaluation:
+        every: 10000
+        query-batch-size: 256
+        top-k: 10
+        beam-size: 40
+        max-beam-size: 320
+        beam-growth: 2
+        val-max-examples: 256
+        
+    curriculum:
+        seq-len:
+            start: 5 # the min sequence length
+            end: 20
+            inc: 1
+            interval: 2000
