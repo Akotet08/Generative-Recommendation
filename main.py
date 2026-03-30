@@ -31,8 +31,8 @@ from utils import (
     PAD_TOKEN,
     SPECIAL_TOKEN_COUNT,
     ExperimentLogger,
-    build_position_token_blocks,
     build_token_sizes,
+    build_valid_sid_prefix_map,
     get_default_transformer_steps,
     load_runtime_config,
     semantic_id_to_tokens,
@@ -330,91 +330,81 @@ def beam_search_next_items(
     memory_key_padding_mask,
     quantizer,
     token_sizes,
-    position_token_blocks,
+    valid_sid_prefix_map,
     top_k,
     beam_size,
     max_beam_size,
     beam_growth,
 ):
-    """Autoregressively decode Semantic IDs with beam search."""
+    """Autoregressively decode Semantic IDs with beam search constrained to valid SID prefixes."""
+    del max_beam_size
+    del beam_growth
+
     requested_top_k = max(int(top_k), 1)
     beam_size = max(int(beam_size), requested_top_k)
-    max_beam_size = max(int(max_beam_size), beam_size)
-    beam_growth = max(int(beam_growth), 2)
-    eos_token_block = torch.tensor([EOS_TOKEN], dtype=torch.long, device=memory.device)
-    allowed_tokens_per_step = list(position_token_blocks) + [eos_token_block]
+    max_decode_steps = len(token_sizes) + 1
+    beams = [([BOS_TOKEN], 0.0)]
 
-    total_invalid_ids = 0
-    total_completed_beams = 0
-    attempts = 0
+    for _ in range(max_decode_steps):
+        beam_tokens = torch.tensor(
+            [tokens for tokens, _ in beams],
+            dtype=torch.long,
+            device=memory.device,
+        )
+        batch_size = beam_tokens.size(0)
+        memory_batch = memory.expand(batch_size, -1, -1)
+        mem_pad_batch = memory_key_padding_mask.expand(batch_size, -1)
 
-    while True:
-        attempts += 1
-        beams = [([BOS_TOKEN], 0.0)]
+        logits = model.decode(
+            beam_tokens,
+            memory_batch,
+            memory_key_padding_mask=mem_pad_batch,
+        )
+        step_log_probs = logits[:, -1, :].log_softmax(dim=-1)
 
-        for allowed_tokens in allowed_tokens_per_step:
-            beam_tokens = torch.tensor(
-                [tokens for tokens, _ in beams],
-                dtype=torch.long,
-                device=memory.device,
-            )
-            batch_size = beam_tokens.size(0)
-            memory_batch = memory.expand(batch_size, -1, -1)
-            mem_pad_batch = memory_key_padding_mask.expand(batch_size, -1)
+        expanded_beams = []
+        for beam_index, (tokens, score) in enumerate(beams):
+            allowed_tokens = valid_sid_prefix_map.get(tuple(tokens))
+            if allowed_tokens is None or allowed_tokens.numel() == 0:
+                continue
 
-            logits = model.decode(
-                beam_tokens,
-                memory_batch,
-                memory_key_padding_mask=mem_pad_batch,
-            )
-            step_log_probs = logits[:, -1, :].log_softmax(dim=-1)
-            allowed_log_probs = step_log_probs.index_select(dim=1, index=allowed_tokens)
-
+            allowed_log_probs = step_log_probs[beam_index].index_select(dim=0, index=allowed_tokens)
             per_beam_width = min(beam_size, allowed_tokens.numel())
-            top_log_probs, top_indices = torch.topk(
-                allowed_log_probs,
-                k=per_beam_width,
-                dim=1,
-            )
+            top_log_probs, top_indices = torch.topk(allowed_log_probs, k=per_beam_width, dim=0)
 
-            expanded_beams = []
-            for beam_index, (tokens, score) in enumerate(beams):
-                for candidate_rank in range(per_beam_width):
-                    next_token = int(
-                        allowed_tokens[top_indices[beam_index, candidate_rank]].item()
-                    )
-                    next_score = score + float(top_log_probs[beam_index, candidate_rank].item())
-                    expanded_beams.append((tokens + [next_token], next_score))
+            for candidate_rank in range(per_beam_width):
+                next_token = int(allowed_tokens[top_indices[candidate_rank]].item())
+                next_score = score + float(top_log_probs[candidate_rank].item())
+                expanded_beams.append((tokens + [next_token], next_score))
 
-            expanded_beams.sort(key=lambda item: item[1], reverse=True)
-            beams = expanded_beams[:beam_size]
-
-        total_completed_beams += len(beams)
-        ranked_items = []
-        seen_items = set()
-        invalid_ids = 0
-        for tokens, _ in beams:
-            semantic_id = tokens_to_semantic_id(tokens[1:-1], token_sizes)
-            item_id = quantizer.lookup_item(semantic_id)
-            if item_id is None:
-                invalid_ids += 1
-                continue
-            if item_id in seen_items:
-                continue
-            seen_items.add(item_id)
-            if len(ranked_items) < requested_top_k:
-                ranked_items.append(item_id)
-
-        total_invalid_ids += invalid_ids
-        if len(ranked_items) >= requested_top_k or beam_size >= max_beam_size:
-            return ranked_items, {
+        if not expanded_beams:
+            return [], {
                 "beam_size_used": beam_size,
-                "attempts": attempts,
-                "invalid_ids": total_invalid_ids,
-                "completed_beams": total_completed_beams,
+                "attempts": 1,
+                "invalid_ids": 0.0,
+                "completed_beams": 0.0,
             }
 
-        beam_size = min(max_beam_size, beam_size * beam_growth)
+        expanded_beams.sort(key=lambda item: item[1], reverse=True)
+        beams = expanded_beams[:beam_size]
+
+    ranked_items = []
+    seen_items = set()
+    for tokens, _ in beams:
+        semantic_id = tokens_to_semantic_id(tokens[1:-1], token_sizes)
+        item_id = quantizer.lookup_item(semantic_id)
+        if item_id is None or item_id in seen_items:
+            continue
+        seen_items.add(item_id)
+        if len(ranked_items) < requested_top_k:
+            ranked_items.append(item_id)
+
+    return ranked_items, {
+        "beam_size_used": beam_size,
+        "attempts": 1,
+        "invalid_ids": 0.0,
+        "completed_beams": float(len(beams)),
+    }
 
 
 def compute_ranking_metrics(rank_position):
@@ -472,7 +462,7 @@ def evaluate_ranking(
         return empty_result
 
     query_batch_size = max(int(query_batch_size), 1)
-    position_token_blocks = build_position_token_blocks(token_sizes, device)
+    valid_sid_prefix_map = build_valid_sid_prefix_map(quantizer.item_to_semantic_id, token_sizes, device)
     totals = {
         "recall@5": 0.0,
         "ndcg@5": 0.0,
@@ -514,7 +504,7 @@ def evaluate_ranking(
                 memory_key_padding_mask=src_pad_mask[batch_index : batch_index + 1],
                 quantizer=quantizer,
                 token_sizes=token_sizes,
-                position_token_blocks=position_token_blocks,
+                valid_sid_prefix_map=valid_sid_prefix_map,
                 top_k=top_k,
                 beam_size=beam_size,
                 max_beam_size=max_beam_size,

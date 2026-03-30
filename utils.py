@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -264,6 +265,26 @@ def build_position_token_blocks(token_sizes, device):
         token_blocks.append(torch.arange(offset, offset + token_size, device=device))
         offset += token_size
     return token_blocks
+
+
+def build_valid_sid_prefix_map(item_to_semantic_id, token_sizes, device):
+    """Map each valid decoder prefix to the allowed next output tokens."""
+    next_tokens_by_prefix = defaultdict(set)
+
+    for semantic_id in item_to_semantic_id.values():
+        output_tokens = [BOS_TOKEN]
+        output_tokens.extend(semantic_id_to_tokens(semantic_id, token_sizes))
+        output_tokens.append(EOS_TOKEN)
+
+        for prefix_length in range(len(output_tokens) - 1):
+            prefix = tuple(output_tokens[: prefix_length + 1])
+            next_token = output_tokens[prefix_length + 1]
+            next_tokens_by_prefix[prefix].add(next_token)
+
+    return {
+        prefix: torch.tensor(sorted(next_tokens), dtype=torch.long, device=device)
+        for prefix, next_tokens in next_tokens_by_prefix.items()
+    }
 
 
 def get_default_transformer_steps(dataset_name, interactions_path, train_steps_config):
